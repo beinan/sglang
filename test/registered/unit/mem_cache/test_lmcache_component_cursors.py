@@ -364,10 +364,9 @@ def test_sparse_lookup_does_not_publish_a_contiguous_prefix(cache_class, local_t
         assert cache.prefetch_loaded_tokens_by_reqid[req.cache_request_handle] == 0
         assert cache.match_prefix(MatchPrefixParams(flow.key, req=req)) == local
     plan = cache.prefill_execution_plan([req.rid], [local_tokens])
-    if local_tokens:
-        assert plan is None
-    else:
-        assert plan.lookups == (flow.lookup,)
+    assert plan.lookups == (flow.lookup,)
+    mixed = cache.prefill_execution_plan([req.rid, "short"], [local_tokens, 0])
+    assert mixed.lookups == (flow.lookup, None)
     with mock.patch.object(UnifiedRadixCache, "on_release"):
         cache.on_release(req, checkpointed=False)
     assert not cache.has_pending_cache_operations()
@@ -389,6 +388,48 @@ def test_approximate_prefill_is_not_published_or_stored(cache_class):
     with mock.patch.object(UnifiedRadixCache, "on_release"):
         cache.on_release(req, checkpointed=True)
     assert req.rid not in cache._blended_requests
+
+
+def test_blend_matches_never_overwrite_shared_prefix():
+    """A span crossing the shared prefix must be recomputed, not transferred."""
+    from sglang.srt.mem_cache.storage.lmcache.blend_prefill import select_blend_matches
+
+    prefix = SimpleNamespace(cur_st=0, cur_ed=4)
+    crossing = SimpleNamespace(cur_st=2, cur_ed=6)
+    suffix = SimpleNamespace(cur_st=4, cur_ed=8)
+    tail = SimpleNamespace(cur_st=8, cur_ed=12)
+    lookup = SimpleNamespace(
+        blend_result=SimpleNamespace(
+            non_prefix_segments=[prefix, crossing, suffix],
+            segmented_prefix_segments=[tail],
+        )
+    )
+    assert select_blend_matches(lookup, 4) == [suffix, tail]
+    assert select_blend_matches(None, 0) == []
+
+
+def test_partial_recompute_publishes_only_exact_loaded_prefix(cache_class):
+    """Remote prefix slots are adopted before the approximate suffix is released."""
+    cache, req, flow, operation, _ = _deferred_load_cache(cache_class)
+    cache._blended_requests.add(req.rid)
+    flow.load = operation
+    flow.load_completed = True
+    flow.anchor_node = flow.anchor_lock = None
+    operation.result = True
+    published = []
+
+    def adopt_prefix(request, *, up_to):
+        assert request.kv.cache_protected_len == 2
+        published.append(up_to)
+        request.kv.protect_prefix(up_to)
+
+    with mock.patch.object(UnifiedRadixCache, "checkpoint", side_effect=adopt_prefix):
+        cache.checkpoint(req, up_to=12)
+    assert published == [8]
+    assert req.kv.cache_protected_len == 8
+    cache.lmcache_connector.submit_store.assert_not_called()
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
+    assert not cache.has_pending_cache_operations()
 
 
 if __name__ == "__main__":

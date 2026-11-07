@@ -16,12 +16,32 @@ if TYPE_CHECKING:
     from lmcache.integration.sglang.unified_lmcache_mp_connector import (
         UnifiedLMCacheMPConnector,
     )
+    from lmcache.v1.multiprocess.custom_types import CBMatchResult
 
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 CALIBRATION_LAYERS = 4
+
+
+def select_blend_matches(
+    lookup: LMCacheBlendLookupOperation | None, prefix_len: int
+) -> list[CBMatchResult]:
+    """Select complete matches outside the shared, immutable cached prefix.
+
+    A match crossing the prefix boundary is recomputed rather than clipped:
+    the connector only accepts complete matches from the lookup result.
+    Requests shorter than a cache page have no lookup and need dense queries.
+    """
+    if lookup is None:
+        return []
+    result = lookup.blend_result
+    return [
+        match
+        for match in result.non_prefix_segments + result.segmented_prefix_segments
+        if match.cur_st >= prefix_len
+    ]
 
 
 class BlendPrefillPlan(msgspec.Struct, frozen=True):
@@ -33,7 +53,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
     """
 
     connector: UnifiedLMCacheMPConnector
-    lookups: tuple[LMCacheBlendLookupOperation, ...]
+    lookups: tuple[LMCacheBlendLookupOperation | None, ...]
     recompute_ratio: float
     page_size: int
     blended_requests: set[str]
@@ -52,6 +72,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
         from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
+            get_req_to_token_pool,
             get_token_to_kv_pool,
         )
         from sglang.srt.model_executor.forward_mode import (
@@ -75,7 +96,6 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
             or any(fb.mm_inputs or [])
             or fb.spec_info is not None
             or fb.attn_cp_metadata is not None
-            or any(fb.extend_prefix_lens_cpu)
             or not all(fb.extend_is_final_cpu)
             or any(
                 value is not None and value is not False for value in kwargs.values()
@@ -98,21 +118,35 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
         slots = fb.out_cache_loc
         covered = torch.zeros(slots.numel(), device=slots.device, dtype=torch.bool)
         offset = 0
-        for lookup, length in zip(self.lookups, fb.extend_seq_lens_cpu, strict=True):
-            result = lookup.blend_result
-            matches = result.non_prefix_segments + result.segmented_prefix_segments
-            # Only complete allocated pages are transferable. Lookup matches end
-            # within the aligned prefix; never fabricate the final page's slots.
-            aligned_length = length // self.page_size * self.page_size
-            indices = self.connector.device_indices_by_group(
-                slots[offset : offset + aligned_length]
-            )
-            future = self.connector.submit_blend_retrieve(
-                lookup, indices, producer_stream=torch.cuda.current_stream()
-            )
-            if future.result():
-                for match in matches:
-                    covered[offset + match.cur_st : offset + match.cur_ed] = True
+        for row, lookup, length, prefix_len in zip(
+            fb.req_pool_indices_cpu,
+            self.lookups,
+            fb.extend_seq_lens_cpu,
+            fb.extend_prefix_lens_cpu,
+            strict=True,
+        ):
+            matches = select_blend_matches(lookup, prefix_len)
+            if matches:
+                # The request table contains both borrowed prefix and newly
+                # allocated suffix slots. Transfers must not write shared KV.
+                aligned_length = (
+                    (prefix_len + length) // self.page_size * self.page_size
+                )
+                request_slots = get_req_to_token_pool().req_to_token[
+                    row, :aligned_length
+                ]
+                indices = self.connector.device_indices_by_group(request_slots)
+                future = self.connector.submit_blend_retrieve(
+                    lookup,
+                    indices,
+                    matches=matches,
+                    producer_stream=torch.cuda.current_stream(),
+                )
+                if future.result():
+                    for match in matches:
+                        start = offset + match.cur_st - prefix_len
+                        end = offset + match.cur_ed - prefix_len
+                        covered[start:end] = True
             offset += length
         if not bool(covered.any()):
             return model.forward(fb.input_ids, fb.positions, fb, **kwargs)
@@ -147,7 +181,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
                 for op, query_len, length in zip(
                     self.lookups, query_lens, fb.extend_seq_lens_cpu, strict=True
                 )
-                if query_len != length
+                if op is not None and query_len != length
             )
             handoff = residual_batch.to_pp(hidden, fb)
             compact = copy.copy(fb)

@@ -290,23 +290,28 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self, request_ids: list[str], prefix_lens: list[int]
     ) -> Optional[PrefillExecutionPlan]:
         """Keep sparse matches separate from the radix tree's contiguous hits."""
-        if self._blend_ratio is None or any(prefix_lens):
+        if self._blend_ratio is None:
             return None
-        from sglang.srt.mem_cache.storage.lmcache.blend_prefill import BlendPrefillPlan
+        from sglang.srt.mem_cache.storage.lmcache.blend_prefill import (
+            BlendPrefillPlan,
+            select_blend_matches,
+        )
 
         lookups = []
         for rid in request_ids:
             flow = self._external_flows.get(rid)
-            if flow is None or flow.cancelled or flow.total_hit is None:
+            if flow is None:
+                lookups.append(None)
+                continue
+            if flow.cancelled or flow.total_hit is None or rid in self._declined_loads:
                 return None
             result = flow.lookup.blend_result
             if result is None:
                 return None
             lookups.append(flow.lookup)
         if not any(
-            op.blend_result.non_prefix_segments
-            or op.blend_result.segmented_prefix_segments
-            for op in lookups
+            select_blend_matches(op, prefix_len)
+            for op, prefix_len in zip(lookups, prefix_lens, strict=True)
         ):
             return None
         return BlendPrefillPlan(
@@ -326,13 +331,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._abandon_attempt(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        self._publish_external_loaded_prefix(req, token_ids_len=up_to)
         if req.rid in self._blended_requests:
-            # Approximate KV must not become an exact prefix for another request.
+            # Adopt only the exact remotely loaded prefix. Approximate suffix
+            # slots stay request-owned and must not enter either cache tier.
+            flow = self._external_flows.get(req.rid)
+            if flow is not None and flow.load is not None:
+                assert flow.total_hit is not None
+                super().checkpoint(req, up_to=min(up_to, flow.total_hit), **kwargs)
             self._retire_loaded_flow(req.rid)
             if req.finished():
                 self._request_session_finish(req.rid)
             return
-        self._publish_external_loaded_prefix(req, token_ids_len=up_to)
         super().checkpoint(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
         self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
