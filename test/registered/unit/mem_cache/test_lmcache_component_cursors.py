@@ -535,3 +535,22 @@ def test_checkpoint_preserves_blend_lookup_until_final_prefill(
         cache.token_to_kv_pool_allocator.free.assert_not_called()
     if phase == "finished":
         cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)
+
+
+def test_final_blend_checkpoint_preserves_published_dense_chunks(cache_class):
+    """The final approximate suffix must not shorten an earlier exact checkpoint."""
+    cache, req, flow, operation, _ = _deferred_load_cache(cache_class)
+    cache._blend_ratio = 0.5
+    cache._blended_requests.add(req.rid)
+    req.full_untruncated_fill_ids = list(range(40))
+    req.kv.protect_prefix(16)
+    flow.load = operation
+    flow.load_completed = flow.prefix_published = True
+    flow.anchor_node = flow.anchor_lock = None
+    operation.result = True
+    with mock.patch.object(UnifiedRadixCache, "checkpoint") as publish:
+        cache.checkpoint(req, up_to=40)
+    publish.assert_not_called()
+    assert req.kv.cache_protected_len == 16
+    cache.lmcache_connector.submit_store.assert_not_called()
+    cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)

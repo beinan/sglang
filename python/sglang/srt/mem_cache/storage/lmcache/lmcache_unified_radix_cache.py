@@ -352,7 +352,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             flow = self._external_flows.get(req.rid)
             if flow is not None and flow.load is not None:
                 assert flow.total_hit is not None
-                super().checkpoint(req, up_to=min(up_to, flow.total_hit), **kwargs)
+                exact_prefix_end = min(up_to, flow.total_hit)
+                if req.kv.cache_protected_len < exact_prefix_end:
+                    super().checkpoint(req, up_to=exact_prefix_end, **kwargs)
             if retire_flow:
                 self._retire_loaded_flow(req.rid)
             if req.finished():
