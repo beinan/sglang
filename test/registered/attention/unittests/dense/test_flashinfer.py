@@ -1,6 +1,8 @@
 import unittest
+from importlib.metadata import version
 
 import torch
+from packaging.version import Version
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.sparse_query import SparseQueryMetadata
@@ -319,11 +321,9 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                     run_dense_fixture_eager(fixture)
                     batch = fixture.forward_batch
                     selected = torch.tensor(
-                        (
-                            [7, 16, 16, 18, 37, 37]
-                            if repeated
-                            else [0, 7, 16, 18, 22, 37]
-                        )[: 3 * batch_size],
+                        ([7, 16, 16, 37, 37] if repeated else [0, 7, 16, 18, 37])[
+                            : 3 * batch_size
+                        ],
                         device="cuda",
                     )
                     fixture.input_hidden[selected] += 0.5
@@ -340,17 +340,18 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                         batch, fixture.runner.runner_ids, cols=selected
                     )
                     batch.extend_num_tokens = len(selected)
+                    query_lens = (3, 2)[:batch_size]
                     batch.extend_seq_lens = torch.tensor(
-                        [3] * batch_size, dtype=torch.int32, device="cuda"
+                        query_lens, dtype=torch.int32, device="cuda"
                     )
-                    batch.extend_seq_lens_cpu = [3] * batch_size
+                    batch.extend_seq_lens_cpu = list(query_lens)
                     batch.extend_start_loc = torch.tensor(
                         [3 * i for i in range(batch_size)],
                         dtype=torch.int32,
                         device="cuda",
                     )
                     batch.sparse_query = SparseQueryMetadata(
-                        (3,) * batch_size, batch.positions
+                        query_lens, batch.positions
                     )
 
                     actual = run_dense_fixture_eager(fixture)
@@ -378,6 +379,47 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                             atol=0,
                             rtol=0,
                         )
+
+    @unittest.skipUnless(
+        is_flashinfer_available()
+        and Version(version("flashinfer-python")) >= Version("0.7.3"),
+        "CuTe sparse prefill requires FlashInfer 0.7.3",
+    )
+    def test_sparse_position_storage_scales_with_total_queries(self) -> None:
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        from sglang.srt.layers.attention.cute_sparse_prefill import CuTeSparsePrefill
+
+        lengths = (4096,) + (1,) * 63
+        positions = torch.cat(
+            (
+                torch.arange(4096, device="cuda"),
+                torch.zeros(63, device="cuda", dtype=torch.int64),
+            )
+        )
+        tokens = torch.cat(
+            (
+                torch.arange(4096, device="cuda"),
+                4096 + 16 * torch.arange(63, device="cuda"),
+            )
+        ).to(torch.int32)
+        fallback = BatchPrefillWithPagedKVCacheWrapper(
+            torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        )
+        adapter = CuTeSparsePrefill(
+            fallback,
+            SparseQueryMetadata(lengths, positions),
+            tokens,
+            list(lengths),
+            16,
+            4,
+            2,
+            128,
+        )
+        self.assertLessEqual(
+            adapter.variant.extra_params.numel(),
+            2 * (sum(lengths) + len(lengths) + 256),
+        )
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
