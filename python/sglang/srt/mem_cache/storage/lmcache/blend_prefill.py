@@ -155,6 +155,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
         )
         slots = fb.out_cache_loc
         covered = torch.zeros(slots.numel(), device=slots.device, dtype=torch.bool)
+        retrieved = False
         offset = 0
         for row, lookup, length, prefix_len in zip(
             fb.req_pool_indices_cpu,
@@ -181,17 +182,16 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
                     producer_stream=torch.cuda.current_stream(),
                 )
                 if future.result():
+                    retrieved = True
                     for match in matches:
                         start = offset + match.cur_st - prefix_len
                         end = offset + match.cur_ed - prefix_len
                         covered[start:end] = True
             offset += length
-        if not bool(covered.any()):
+        if not retrieved:
             return model.forward(fb.input_ids, fb.positions, fb, **kwargs)
 
-        cached_keys = (
-            pool.layer_router.read(CALIBRATION_LAYERS - 1).key()[slots].clone()
-        )
+        cached_keys = pool.layer_router.read(CALIBRATION_LAYERS - 1).key()[slots]
         hidden = body.embed_tokens(fb.input_ids)
         residual_batch.start(fb)
         compact = None
@@ -245,8 +245,8 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
             hidden = body.layers[CALIBRATION_LAYERS].attn_boundary.from_pp(
                 PPProxyTensors(
                     {
-                        "hidden_states": handoff["hidden_states"][selected].clone(),
-                        "residual": handoff["residual"][selected].clone(),
+                        "hidden_states": handoff["hidden_states"][selected],
+                        "residual": handoff["residual"][selected],
                     }
                 ),
                 compact,
