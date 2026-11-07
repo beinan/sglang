@@ -54,3 +54,12 @@ python -m sglang.launch_server \
 ```
 
 For full LMCache config options see https://docs.lmcache.ai/api_reference/configurations.html.
+
+If a cache retrieve cannot be admitted, SGLang falls back to local prefill without
+publishing the retrieved prefix. Its private KV slots and Mamba checkpoint stay
+allocated until the transfer completes, even if admission timed out. This keeps
+late remote writes away from slots reused by another request.
+
+Cache reset and shutdown drain outstanding loads and stores before releasing
+buffers. If draining raises an error, reset propagates it and retains ownership
+so cleanup can be retried after the transfer completes.

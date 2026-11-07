@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from concurrent.futures import Future
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
@@ -10,7 +11,9 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     IncLockRefResult,
+    InitLoadBackParams,
     InsertResult,
+    MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -43,6 +46,7 @@ def cache_class():
 def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
     cache = cache_class.__new__(cache_class)
     cache.is_swa_enabled = swa_enabled
+    cache._declined_loads = set()
     cache.lmcache_connector = SimpleNamespace(aligned_swa_window_size=lambda: 4)
     flow = SimpleNamespace(
         load=SimpleNamespace(local_hit_tokens=2, device_indices=torch.arange(2, 8)),
@@ -186,6 +190,152 @@ def test_aborted_request_waits_for_load_and_store(
         cache.token_to_kv_pool_allocator.free.call_args.args[0],
         flow.load.device_indices,
     )
+    assert not cache.has_pending_cache_operations()
+
+
+def _deferred_load_cache(cache_class, *, mamba_enabled=False):
+    cache, req, flow = _cache_and_request(cache_class, swa_enabled=False)
+    req.cache_request_handle = CacheRequestHandle(rid=req.rid, attempt_id=0)
+    req.full_untruncated_fill_ids = list(range(8))
+    req.extra_key, req.cache_salt = None, ""
+    req.finished = lambda: True
+    flow.lookup = SimpleNamespace(request_id=req.rid)
+    flow.load = None
+    flow.local_hit_tokens = 2
+    flow.load_completed = flow.cancelled = flow.retire_requested = False
+    flow.released_skip_tokens = 0
+    cache._mamba_component = object() if mamba_enabled else None
+    cache._forward_stream = "forward"
+    cache._pending_stores, cache._pending_store_counts = [], {}
+    cache._session_finish_requested = set()
+    cache.prefetch_loaded_tokens_by_reqid = {}
+    cache.prefetch_loaded_storage_start_by_reqid = {}
+    cache.tree_core = SimpleNamespace(is_eagle=False)
+    cache.page_size = 2
+    cache.req_to_token_pool = mock.Mock()
+    allocator = cache.token_to_kv_pool_allocator = mock.Mock()
+    allocator.available_size.return_value = 32
+    allocator.alloc.return_value = torch.arange(2, 8)
+    allocator.state_slots.alloc.side_effect = [torch.tensor([11]), torch.tensor([12])]
+    cache.inc_lock_ref = mock.Mock(return_value=IncLockRefResult(node_id=42))
+    cache.dec_lock_ref = mock.Mock()
+    future = Future()
+    operation = SimpleNamespace(
+        request_id=req.rid,
+        future=future,
+        result=None,
+        device_indices=allocator.alloc.return_value,
+        local_hit_tokens=2,
+    )
+    operation.query = lambda: operation.result is not None or future.done()
+    connector = cache.lmcache_connector = mock.Mock()
+    connector.chunk_size = 2
+    connector.operation_timeout = 0
+    connector.submit_load.return_value = operation
+    connector.get_store_start.return_value = 8
+    connector.ready_prefix_count.side_effect = lambda operations: sum(
+        op.query() for op in operations
+    )
+
+    def decline_load(load, stream):
+        # A failed admission/drain can cache False without finishing device work.
+        load.result = False
+        return False
+
+    def complete_load(load, **kwargs):
+        load.result = load.future.result(timeout=0)
+        return load.result
+
+    connector.prepare_load_on_stream.side_effect = decline_load
+    connector.complete_load.side_effect = complete_load
+    return cache, req, flow, operation, future
+
+
+@pytest.mark.parametrize("mamba_enabled", [False, True])
+@pytest.mark.parametrize("load_success", [False, True])
+def test_declined_load_retains_slots_until_transfer_completes(
+    cache_class, mamba_enabled, load_success
+):
+    cache, req, flow, operation, future = _deferred_load_cache(
+        cache_class, mamba_enabled=mamba_enabled
+    )
+    local = MatchResult(
+        device_prefix_len=2,
+        last_device_node=42,
+        last_host_node=None,
+        best_match_node=None,
+    )
+    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=local):
+        assert cache.init_load_back(InitLoadBackParams(42, 6, req=req)) == (0, 42)
+        assert cache.check_prefetch_progress(req.cache_request_handle)
+        assert (
+            cache.match_prefix(MatchPrefixParams(flow.key, req=req, cow_mamba=True))
+            == local
+        )
+        assert req.kv.mamba_cow_src_index is None
+        if mamba_enabled:
+            # Dense fallback may allocate new mutable state while H2D is pending.
+            req.kv.mamba_pool_idx = torch.tensor(99)
+        with mock.patch.object(UnifiedRadixCache, "checkpoint"):
+            cache.checkpoint(req, up_to=8)
+    assert req.kv.cache_protected_len == 8
+    cache.check_hicache_events()
+    cache.lmcache_connector.complete_load.assert_not_called()
+    cache.lmcache_connector.finish_request.assert_not_called()
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
+    cache.dec_lock_ref.assert_not_called()
+    state_free = cache.token_to_kv_pool_allocator.state_slots.free
+    if mamba_enabled:
+        state_free.assert_called_once()
+        torch.testing.assert_close(state_free.call_args.args[0], torch.tensor([12]))
+    future.set_result(load_success)
+    cache.check_hicache_events()
+    cache.check_hicache_events()
+    cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)
+    cache.token_to_kv_pool_allocator.free.assert_called_once()
+    torch.testing.assert_close(
+        cache.token_to_kv_pool_allocator.free.call_args.args[0],
+        operation.device_indices,
+    )
+    cache.dec_lock_ref.assert_called_once()
+    if mamba_enabled:
+        assert state_free.call_count == 2
+        torch.testing.assert_close(state_free.call_args.args[0], torch.tensor([11]))
+        assert req.kv.mamba_pool_idx.item() == 99
+    assert not cache.has_pending_cache_operations()
+
+
+def test_reset_waits_for_all_transfers_before_releasing_any_slots(cache_class):
+    cache, req, flow, operation, future = _deferred_load_cache(cache_class)
+    local = MatchResult(
+        device_prefix_len=2,
+        last_device_node=42,
+        last_host_node=None,
+        best_match_node=None,
+    )
+    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=local):
+        cache.init_load_back(InitLoadBackParams(42, 6, req=req))
+    stored = Future()
+    cache._pending_stores = [
+        SimpleNamespace(
+            operation=SimpleNamespace(future=stored), node_id=43, lock_params=object()
+        )
+    ]
+    with mock.patch.object(UnifiedRadixCache, "reset") as reset_tree:
+        with pytest.raises(TimeoutError):
+            cache.reset()
+        future.set_result(True)
+        with pytest.raises(TimeoutError):
+            cache.reset()
+        cache.token_to_kv_pool_allocator.free.assert_not_called()
+        cache.dec_lock_ref.assert_not_called()
+        cache.lmcache_connector.end_all_sessions.assert_not_called()
+        reset_tree.assert_not_called()
+        stored.set_result(True)
+        cache.reset()
+        cache.reset()
+    cache.token_to_kv_pool_allocator.free.assert_called_once()
+    assert cache.dec_lock_ref.call_count == 2
     assert not cache.has_pending_cache_operations()
 
 

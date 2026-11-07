@@ -78,6 +78,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._pending_stores: list[LMCachePendingStore] = []
         self._pending_store_counts: dict[str, int] = {}
         self._session_finish_requested: set[str] = set()
+        # Declined admission can still have remote writes into private slots.
+        self._declined_loads: set[str] = set()
         self._lmcache_closed = False
         atexit.register(self.shutdown)
 
@@ -103,6 +105,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         requested_key_len = len(params.key)
         req = params.req
         flow = self._external_flows.get(req.rid) if req is not None else None
+        if req is not None and req.rid in self._declined_loads:
+            flow = None
         if (
             flow is not None
             and flow.total_hit is not None
@@ -222,6 +226,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             return True
         if flow.cancelled:
             return False
+        if req_id in self._declined_loads:
+            return True
 
         if flow.total_hit is None:
             total_hit = self.lmcache_connector.poll_lookup(flow.lookup)
@@ -287,9 +293,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             success = self.lmcache_connector.complete_load(flow.load)
             flow.load_completed = True
             cancelled = flow.cancelled
-            if cancelled or not success:
+            if (
+                cancelled
+                or not success
+                or flow.lookup.request_id in self._declined_loads
+            ):
                 self._finish_failed_load(flow)
-                if not cancelled:
+                if not cancelled and not success:
                     logger.warning(
                         "LMCache retrieve failed after admission for request %s",
                         flow.lookup.request_id,
@@ -387,14 +397,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         return self.lmcache_connector.clear()
 
     def reset(self) -> None:
+        """Drain transfers before resetting; propagate failures without freeing slots."""
         connector = self.lmcache_connector
         if connector is not None:
+            # A timeout is not cancellation. Leave ownership intact if any
+            # transfer cannot be drained, so a later reset can retry safely.
+            for flow in self._external_flows.values():
+                if flow.load is not None:
+                    flow.load.future.result(timeout=connector.operation_timeout)
+            for pending in self._pending_stores:
+                pending.operation.future.result(timeout=connector.operation_timeout)
             for flow in list(self._external_flows.values()):
                 if flow.load is not None:
-                    try:
-                        flow.load.future.result(timeout=connector.operation_timeout)
-                    except Exception:
-                        pass
                     connector.complete_load(flow.load, synchronize=False)
                     flow.load_completed = True
                     if flow.prefix_published:
@@ -411,16 +425,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                         flow.mamba_value = None
                     self._release_flow_anchor(flow)
             for pending in list(self._pending_stores):
-                try:
-                    pending.operation.future.result(timeout=connector.operation_timeout)
-                except Exception:
-                    pass
                 connector.complete_store(pending.operation, synchronize=False)
                 self.dec_lock_ref(pending.node_id, pending.lock_params)
             self._external_flows.clear()
             self._pending_stores.clear()
             self._pending_store_counts.clear()
             self._session_finish_requested.clear()
+            self._declined_loads.clear()
             self.prefetch_loaded_tokens_by_reqid.clear()
             connector.end_all_sessions()
         super().reset()
@@ -617,6 +628,26 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 # Forward waits for H2D before deferred Mamba COW runs.
                 self._arm_external_mamba_cow(flow, req)
         except Exception:
+            if flow.load is not None:
+                self._declined_loads.add(req.rid)
+                # Older connectors cache False after a failed admission even
+                # when the drain timed out. Resume polling the transfer itself.
+                flow.load.result = None
+                if allocated_request_mamba_for_load and request_mamba_value is not None:
+                    self.token_to_kv_pool_allocator.state_slots.free(
+                        request_mamba_value
+                    )
+                    req.kv.mamba_pool_idx = None
+                if req.kv.mamba_cow_src_index is mamba_value:
+                    req.kv.mamba_cow_src_index = None
+                flow.request_mamba_value = None
+                flow.allocated_request_mamba_for_load = False
+                flow.load_req = None
+                logger.exception(
+                    "LMCache retrieve admission failed for %s; retaining pending slots",
+                    flow.lookup.request_id,
+                )
+                return None
             self.token_to_kv_pool_allocator.free(device_indices)
             if allocated_mamba_for_load and mamba_value is not None:
                 self.token_to_kv_pool_allocator.state_slots.free(mamba_value)
@@ -694,6 +725,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._release_flow_anchor(flow)
         rid = flow.lookup.request_id
         self._external_flows.pop(rid, None)
+        self._declined_loads.discard(rid)
         if handle is not None:
             if flow.cancelled:
                 self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
@@ -747,7 +779,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.retire_requested = True
         if not flow.load_completed:
             return
-        if flow.load.result:
+        if flow.load.result and rid not in self._declined_loads:
             self._finalize_retired_flow(flow)
         else:
             cancelled = flow.cancelled
@@ -783,6 +815,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             or flow.load is None
             or flow.total_hit is None
             or flow.prefix_published
+            or req.rid in self._declined_loads
         ):
             return
         # Restore the ownership boundary once before the parent cache callback.
