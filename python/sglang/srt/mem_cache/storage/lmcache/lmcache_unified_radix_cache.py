@@ -76,6 +76,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
         from lmcache.v1.client.client_config import load_mp_client_config
 
+        from sglang.srt.mem_cache.storage.lmcache.blend_prefill import (
+            BlendRotaryRegistration,
+        )
+
         config = load_mp_client_config(config_file_path=lmcache_config_file)
         self._blend_ratio = config.get_extra_config_value(
             "lmcache.sglang.blend_recompute_ratio", None
@@ -86,6 +90,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             or not 0 <= self._blend_ratio <= 1
         ):
             raise ValueError("blend_recompute_ratio must be a number in [0, 1]")
+        self._blend_rotary_registration = BlendRotaryRegistration(
+            self.lmcache_connector
+        )
         self._blended_requests: set[str] = set()
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
@@ -316,6 +323,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             return None
         return BlendPrefillPlan(
             self.lmcache_connector,
+            self._blend_rotary_registration,
             tuple(lookups),
             self._blend_ratio,
             self.page_size,

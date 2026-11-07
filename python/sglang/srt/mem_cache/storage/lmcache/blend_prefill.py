@@ -44,6 +44,34 @@ def select_blend_matches(
     ]
 
 
+class BlendRotaryRegistration:
+    """Share registration of an immutable model-owned rotary table across prefills."""
+
+    def __init__(self, connector: UnifiedLMCacheMPConnector) -> None:
+        self._connector = connector
+        self._table: torch.Tensor | None = None
+        self._is_neox_style: bool | None = None
+
+    def ensure_registered(
+        self,
+        table: torch.Tensor,
+        *,
+        is_neox_style: bool,
+    ) -> None:
+        """Register a new table or layout, retaining the table for its IPC lifetime.
+
+        The model must replace the tensor when changing its storage or geometry.
+        A failed registration remains retryable on the next call.
+        """
+        if self._table is table and self._is_neox_style == is_neox_style:
+            return
+        # Retain the old IPC allocation until replacement is acknowledged.
+        self._is_neox_style = None
+        self._connector.register_blend_rope(table, is_neox_style=is_neox_style)
+        self._table = table
+        self._is_neox_style = is_neox_style
+
+
 class BlendPrefillPlan(msgspec.Struct, frozen=True):
     """Retrieve into scheduler-owned slots, then recompute selected query rows.
 
@@ -53,6 +81,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
     """
 
     connector: UnifiedLMCacheMPConnector
+    rotary_registration: BlendRotaryRegistration
     lookups: tuple[LMCacheBlendLookupOperation | None, ...]
     recompute_ratio: float
     page_size: int
@@ -112,7 +141,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
 
         body = model.model
         rope = body.layers[0].self_attn.rotary_emb
-        self.connector.register_blend_rope(
+        self.rotary_registration.ensure_registered(
             rope.cos_sin_cache, is_neox_style=rope.is_neox_style
         )
         slots = fb.out_cache_loc

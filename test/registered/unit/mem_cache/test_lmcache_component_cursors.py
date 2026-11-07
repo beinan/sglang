@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lmcache.blend_prefill import BlendRotaryRegistration
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,6 +51,7 @@ def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
     cache._blend_ratio = None
     cache._blended_requests = set()
     cache.lmcache_connector = SimpleNamespace(aligned_swa_window_size=lambda: 4)
+    cache._blend_rotary_registration = BlendRotaryRegistration(cache.lmcache_connector)
     flow = SimpleNamespace(
         load=SimpleNamespace(local_hit_tokens=2, device_indices=torch.arange(2, 8)),
         loaded_skip_tokens=0,
@@ -388,6 +390,36 @@ def test_approximate_prefill_is_not_published_or_stored(cache_class):
     with mock.patch.object(UnifiedRadixCache, "on_release"):
         cache.on_release(req, checkpointed=True)
     assert req.rid not in cache._blended_requests
+
+
+def test_rotary_registration_reuses_only_the_same_table_and_layout():
+    connector = mock.Mock()
+    registration = BlendRotaryRegistration(connector)
+    table = torch.zeros(8, 4)
+    registration.ensure_registered(table, is_neox_style=True)
+    registration.ensure_registered(table, is_neox_style=True)
+    connector.register_blend_rope.assert_called_once_with(table, is_neox_style=True)
+
+    replacement = table.clone()
+    registration.ensure_registered(replacement, is_neox_style=True)
+    registration.ensure_registered(replacement, is_neox_style=False)
+    assert connector.register_blend_rope.call_count == 3
+    connector.register_blend_rope.assert_called_with(replacement, is_neox_style=False)
+
+
+def test_rotary_registration_retries_after_failure():
+    connector = mock.Mock()
+    registration = BlendRotaryRegistration(connector)
+    table = torch.zeros(8, 4)
+    registration.ensure_registered(table, is_neox_style=True)
+    connector.register_blend_rope.side_effect = [
+        RuntimeError("registration failed"),
+        None,
+    ]
+    with pytest.raises(RuntimeError, match="registration failed"):
+        registration.ensure_registered(table.clone(), is_neox_style=True)
+    registration.ensure_registered(table, is_neox_style=True)
+    assert connector.register_blend_rope.call_count == 3
 
 
 def test_blend_matches_never_overwrite_shared_prefix():
