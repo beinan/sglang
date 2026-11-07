@@ -17,7 +17,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage.lmcache.blend_prefill import BlendRotaryRegistration
+from sglang.srt.mem_cache.storage.lmcache.blend_prefill import (
+    BlendPrefillPlan,
+    BlendRotaryRegistration,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -462,6 +465,27 @@ def test_partial_recompute_publishes_only_exact_loaded_prefix(cache_class):
     cache.lmcache_connector.submit_store.assert_not_called()
     cache.token_to_kv_pool_allocator.free.assert_not_called()
     assert not cache.has_pending_cache_operations()
+
+
+@pytest.mark.parametrize("lora_ids", [["adapter", None], [None, "adapter"]])
+def test_blend_lora_batch_uses_dense_forward(lora_ids):
+    """Mixed adapter/base requests keep their original rows and forward options."""
+    connector = mock.Mock()
+    plan = BlendPrefillPlan(
+        connector, BlendRotaryRegistration(connector), (None, None), 0.25, 64, set()
+    )
+    batch = SimpleNamespace(
+        lora_ids=lora_ids, input_ids=torch.arange(8), positions=torch.arange(8)
+    )
+    model = mock.Mock()
+
+    result = plan.execute(model, batch, pp_proxy_tensors=None)
+
+    assert result is model.forward.return_value
+    model.forward.assert_called_once_with(
+        batch.input_ids, batch.positions, batch, pp_proxy_tensors=None
+    )
+    assert connector.mock_calls == []
 
 
 if __name__ == "__main__":

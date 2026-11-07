@@ -94,7 +94,16 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
 
         Unsupported request modes use the ordinary dense model forward without
         loading sparse KV. Approximate results are excluded from cache writeback.
+        Active LoRA batches retain the dense rows used to prepare adapter routing.
         """
+        if any(uid is not None for uid in forward_batch.lora_ids):
+            return model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
         from sglang.srt.layers.logits_processor import LogitsMetadata
