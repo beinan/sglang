@@ -339,6 +339,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._abandon_attempt(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        """Publish exact KV, retaining blend lookups until the final prefill chunk."""
+        retire_flow = (
+            self._blend_ratio is None
+            or req.finished()
+            or up_to >= len(req.full_untruncated_fill_ids)
+        )
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
         if req.rid in self._blended_requests:
             # Adopt only the exact remotely loaded prefix. Approximate suffix
@@ -347,12 +353,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             if flow is not None and flow.load is not None:
                 assert flow.total_hit is not None
                 super().checkpoint(req, up_to=min(up_to, flow.total_hit), **kwargs)
-            self._retire_loaded_flow(req.rid)
+            if retire_flow:
+                self._retire_loaded_flow(req.rid)
             if req.finished():
                 self._request_session_finish(req.rid)
             return
         super().checkpoint(req, up_to=up_to, **kwargs)
-        self._retire_loaded_flow(req.rid)
+        if retire_flow:
+            self._retire_loaded_flow(req.rid)
         self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
         if req.finished():
             self._request_session_finish(req.rid)

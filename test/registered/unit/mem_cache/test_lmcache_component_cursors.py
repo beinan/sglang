@@ -352,6 +352,7 @@ def test_sparse_lookup_does_not_publish_a_contiguous_prefix(cache_class, local_t
     cache, req, flow, _, _ = _deferred_load_cache(cache_class)
     cache._blend_ratio = 0.25
     flow.total_hit = None
+    flow.anchor_node = flow.anchor_lock = None
     flow.lookup.lock_start = 0
     flow.lookup.blend_result = SimpleNamespace(
         non_prefix_segments=[SimpleNamespace(cur_st=4, cur_ed=8)],
@@ -490,3 +491,47 @@ def test_blend_lora_batch_uses_dense_forward(lora_ids):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("blend_enabled", [False, True])
+@pytest.mark.parametrize("loaded_prefix", [False, True])
+@pytest.mark.parametrize("phase", ["partial", "final", "finished"])
+def test_checkpoint_preserves_blend_lookup_until_final_prefill(
+    cache_class, blend_enabled, loaded_prefix, phase
+):
+    """Dense intermediate chunks must not discard later sparse matches."""
+    cache, req, flow, operation, _ = _deferred_load_cache(cache_class)
+    cache._blend_ratio = 0.5 if blend_enabled else None
+    req.full_untruncated_fill_ids = list(range(40))
+    req.finished = lambda: phase == "finished"
+    flow.anchor_node = flow.anchor_lock = None
+    flow.lookup.lock_start = 0
+    flow.lookup.blend_result = SimpleNamespace(
+        non_prefix_segments=[SimpleNamespace(cur_st=24, cur_ed=32)],
+        segmented_prefix_segments=[],
+    )
+    if loaded_prefix:
+        flow.load = operation
+        flow.load_req = req
+        flow.load_completed = True
+        operation.result = True
+    up_to = 40 if phase == "final" else 16
+    with (
+        mock.patch.object(UnifiedRadixCache, "checkpoint"),
+        mock.patch.object(cache_class, "_submit_store"),
+    ):
+        cache.checkpoint(req, up_to=up_to)
+    plan = cache.prefill_execution_plan([req.rid], [16])
+    retained = blend_enabled and phase == "partial"
+    assert (plan is not None) == retained
+    if retained:
+        assert plan.lookups == (flow.lookup,)
+        cache.lmcache_connector.free_lookup_locks.assert_not_called()
+        cache.lmcache_connector.finish_request.assert_not_called()
+        with mock.patch.object(UnifiedRadixCache, "on_release"):
+            cache.on_release(req, checkpointed=False)
+        assert not cache.has_pending_cache_operations()
+        cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)
+        cache.token_to_kv_pool_allocator.free.assert_not_called()
+    if phase == "finished":
+        cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)
