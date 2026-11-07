@@ -442,6 +442,11 @@ def test_blend_matches_never_overwrite_shared_prefix():
     )
     assert select_blend_matches(lookup, 4) == [suffix, tail]
     assert select_blend_matches(None, 0) == []
+    # Growing windows transfer only whole matches in their newly allocated range.
+    assert select_blend_matches(lookup, 4, 8) == [suffix]
+    assert select_blend_matches(lookup, 8, 12) == [tail]
+    assert select_blend_matches(lookup, 4, 6) == []
+    assert select_blend_matches(lookup, 6, 10) == []
 
 
 def test_partial_recompute_publishes_only_exact_loaded_prefix(cache_class):

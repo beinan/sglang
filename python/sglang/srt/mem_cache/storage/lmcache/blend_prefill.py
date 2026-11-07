@@ -26,13 +26,17 @@ CALIBRATION_LAYERS = 4
 
 
 def select_blend_matches(
-    lookup: LMCacheBlendLookupOperation | None, prefix_len: int
+    lookup: LMCacheBlendLookupOperation | None,
+    prefix_len: int,
+    allocated_end: int | None = None,
 ) -> list[CBMatchResult]:
     """Select complete matches outside the shared, immutable cached prefix.
 
-    A match crossing the prefix boundary is recomputed rather than clipped:
-    the connector only accepts complete matches from the lookup result.
-    Requests shorter than a cache page have no lookup and need dense queries.
+    Only matches contained in [prefix_len, allocated_end) may be transferred.
+    The optional end bounds the currently allocated complete pages; omitting it
+    checks whether any later chunk can blend. Matches crossing either boundary
+    are recomputed rather than clipped because the connector accepts only
+    complete matches from the lookup result. Short requests have no lookup.
     """
     if lookup is None:
         return []
@@ -41,6 +45,7 @@ def select_blend_matches(
         match
         for match in result.non_prefix_segments + result.segmented_prefix_segments
         if match.cur_st >= prefix_len
+        and (allocated_end is None or match.cur_ed <= allocated_end)
     ]
 
 
@@ -90,7 +95,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
     def execute(
         self, model: torch.nn.Module, forward_batch: ForwardBatch, **kwargs
     ) -> LogitsProcessorOutput:
-        """Use sparse prefill only for complete plain-text Qwen3 prompts.
+        """Use sparse prefill for allocated plain-text Qwen3 prompt chunks.
 
         Unsupported request modes use the ordinary dense model forward without
         loading sparse KV. Approximate results are excluded from cache writeback.
@@ -134,7 +139,6 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
             or any(fb.mm_inputs or [])
             or fb.spec_info is not None
             or fb.attn_cp_metadata is not None
-            or not all(fb.extend_is_final_cpu)
             or any(
                 value is not None and value is not False for value in kwargs.values()
             )
@@ -164,13 +168,11 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
             fb.extend_prefix_lens_cpu,
             strict=True,
         ):
-            matches = select_blend_matches(lookup, prefix_len)
+            aligned_length = (prefix_len + length) // self.page_size * self.page_size
+            matches = select_blend_matches(lookup, prefix_len, aligned_length)
             if matches:
                 # The request table contains both borrowed prefix and newly
                 # allocated suffix slots. Transfers must not write shared KV.
-                aligned_length = (
-                    (prefix_len + length) // self.page_size * self.page_size
-                )
                 request_slots = get_req_to_token_pool().req_to_token[
                     row, :aligned_length
                 ]
