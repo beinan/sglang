@@ -6,7 +6,7 @@ from itertools import accumulate
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.typing import Float32
+from cutlass.cute.typing import Float32, Int32
 from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 from flashinfer.cute_dsl.attention import AttentionVariant, BatchPrefillCuteDSLWrapper
 
@@ -28,8 +28,9 @@ class OriginalQueryPositions(AttentionVariant):
 
     @cute.jit
     def score_mod(self, score, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
+        offset = Int32(self.params[batch_idx])
         return cutlass.select_(
-            kv_idx > self.params[batch_idx, qo_idx], -Float32.inf, score
+            kv_idx > self.params[offset + qo_idx], -Float32.inf, score
         )
 
 
@@ -40,8 +41,9 @@ class CuTeSparsePrefill:
     and internally contiguous within each page. Referenced KV pages must contain
     finite values, including unused final-page rows, as required by CuTe TMA.
     The caller retains this object through the prefill; all tensors are created
-    and consumed on the caller's current CUDA stream. Query and batch capacities
-    are rounded to powers of two to bound compilation variants across lengths.
+    and consumed on the caller's current CUDA stream. Position storage is linear
+    in the total query count plus batch size, with a 256-entry tail for masked
+    query lanes. Its capacity is bucketed to bound compilation variants.
     """
 
     def __init__(
@@ -61,16 +63,22 @@ class CuTeSparsePrefill:
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         device = query.positions.device
-        batch_capacity = 1 << (len(kv_lens) - 1).bit_length()
-        query_capacity = max(256, 1 << (max(query.query_lens) - 1).bit_length())
-        positions = torch.full(
-            (batch_capacity, query_capacity), -1.0, device=device, dtype=torch.float32
+        query_offsets = list(accumulate(query.query_lens, initial=0))
+        batch_size = len(query.query_lens)
+        num_queries = query_offsets[-1]
+        # Invalid query lanes may read beyond their request's positions; only
+        # the final request needs padding to keep those loads in bounds.
+        capacity = 1 << (batch_size + num_queries + 256 - 1).bit_length()
+        positions = torch.full((capacity,), -1.0, device=device, dtype=torch.float32)
+        positions[:batch_size] = torch.tensor(
+            [batch_size + offset for offset in query_offsets[:-1]],
+            dtype=torch.float32,
+            device=device,
         )
-        for row, selected in enumerate(query.positions.split(query.query_lens)):
-            positions[row, : selected.numel()] = selected
+        positions[batch_size : batch_size + num_queries] = query.positions
         self.variant = OriginalQueryPositions(positions)
         self.qo_indptr = torch.tensor(
-            list(accumulate(query.query_lens, initial=0)),
+            query_offsets,
             dtype=torch.int32,
             device=device,
         )
