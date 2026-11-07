@@ -323,7 +323,11 @@ class EagerRunner(BaseRunner):
             device_timer_ctx(model_runner.device_timer, category),
             forward_context(get_forward_context(), forward_batch=forward_batch),
         ):
-            if cp_active and (
+            if forward_batch.prefill_plan is not None:
+                ret = forward_batch.prefill_plan.execute(
+                    model_runner.model, forward_batch, **kwargs
+                )
+            elif cp_active and (
                 not get_parallel().enable_cp_tp_group_sharing
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):

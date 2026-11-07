@@ -2107,6 +2107,7 @@ class ModelRunner:
 
             if (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                and forward_batch.prefill_plan is None
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

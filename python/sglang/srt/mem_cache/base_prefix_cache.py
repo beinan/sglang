@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.model_executor.prefill_plan import PrefillExecutionPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -439,6 +440,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 time.perf_counter() - start_time
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
+
+    def prefill_execution_plan(
+        self, request_ids: list[str], prefix_lens: list[int]
+    ) -> Optional[PrefillExecutionPlan]:
+        """Return request-owned eager prefill work, or use ordinary model forward."""
+        return None
 
     def release_host_resources(self) -> None:
         """Release pinned host buffers in userspace on graceful shutdown.

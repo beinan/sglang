@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.prefill_plan import PrefillExecutionPlan
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -566,6 +567,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
+    prefill_plan: Optional[PrefillExecutionPlan] = None
     capture_hidden_mode: CaptureHiddenMode = None
     # CUDA-graph runners may capture only the transformer body and execute the
     # logits processor eagerly after replay.
@@ -909,6 +911,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
         input_ids_from_graph: bool = False,
+        prefill_plan: Optional[PrefillExecutionPlan] = None,
     ):
         # init_new must not mutate ScheduleBatch; use explicit forward overrides.
         # Speculative forwards share iteration_ids and select their write_cols;
@@ -982,6 +985,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else None
         )
         ret = cls(
+            prefill_plan=prefill_plan,
             # Required core inputs
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),

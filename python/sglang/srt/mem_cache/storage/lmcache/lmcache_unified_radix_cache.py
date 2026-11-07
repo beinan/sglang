@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.model_executor.prefill_plan import PrefillExecutionPlan
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,19 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             mamba_component=self._mamba_component,
             sliding_window_size=self._sliding_window_size,
         )
+        from lmcache.v1.client.client_config import load_mp_client_config
+
+        config = load_mp_client_config(config_file_path=lmcache_config_file)
+        self._blend_ratio = config.get_extra_config_value(
+            "lmcache.sglang.blend_recompute_ratio", None
+        )
+        if self._blend_ratio is not None and (
+            isinstance(self._blend_ratio, bool)
+            or not isinstance(self._blend_ratio, (int, float))
+            or not 0 <= self._blend_ratio <= 1
+        ):
+            raise ValueError("blend_recompute_ratio must be a number in [0, 1]")
+        self._blended_requests: set[str] = set()
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
         self._pending_stores: list[LMCachePendingStore] = []
@@ -208,7 +222,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if len(key) == 0:
             return
         token_ids = key.raw_token_ids()[: len(key)]
-        lookup = self.lmcache_connector.submit_lookup(
+        submit_lookup = (
+            self.lmcache_connector.submit_blend_lookup
+            if self._blend_ratio is not None
+            else self.lmcache_connector.submit_lookup
+        )
+        lookup = submit_lookup(
             req_id,
             token_ids,
             local_hit_tokens=min(len(local_tokens), len(key)),
@@ -253,24 +272,66 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.lmcache_connector.free_lookup_locks(
                     req_id, start=0, end=release_end
                 )
-            if total_hit <= local_hit_tokens:
+            if total_hit <= local_hit_tokens and self._blend_ratio is None:
                 self._external_flows.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid[handle] = 0
                 self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
                 return True
             flow.total_hit = total_hit
             flow.local_hit_tokens = local_hit_tokens
-            self.prefetch_loaded_tokens_by_reqid[handle] = total_hit - local_hit_tokens
+            self.prefetch_loaded_tokens_by_reqid[handle] = max(
+                total_hit - local_hit_tokens, 0
+            )
             self.prefetch_loaded_storage_start_by_reqid[handle] = local_hit_tokens
 
         return True
 
+    def prefill_execution_plan(
+        self, request_ids: list[str], prefix_lens: list[int]
+    ) -> Optional[PrefillExecutionPlan]:
+        """Keep sparse matches separate from the radix tree's contiguous hits."""
+        if self._blend_ratio is None or any(prefix_lens):
+            return None
+        from sglang.srt.mem_cache.storage.lmcache.blend_prefill import BlendPrefillPlan
+
+        lookups = []
+        for rid in request_ids:
+            flow = self._external_flows.get(rid)
+            if flow is None or flow.cancelled or flow.total_hit is None:
+                return None
+            result = flow.lookup.blend_result
+            if result is None:
+                return None
+            lookups.append(flow.lookup)
+        if not any(
+            op.blend_result.non_prefix_segments
+            or op.blend_result.segmented_prefix_segments
+            for op in lookups
+        ):
+            return None
+        return BlendPrefillPlan(
+            self.lmcache_connector,
+            tuple(lookups),
+            self._blend_ratio,
+            self.page_size,
+            self._blended_requests,
+        )
+
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
-        super().on_release(req, checkpointed=checkpointed)
+        super().on_release(
+            req, checkpointed=checkpointed and req.rid not in self._blended_requests
+        )
+        self._blended_requests.discard(req.rid)
         if not checkpointed:
             self._abandon_attempt(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if req.rid in self._blended_requests:
+            # Approximate KV must not become an exact prefix for another request.
+            self._retire_loaded_flow(req.rid)
+            if req.finished():
+                self._request_session_finish(req.rid)
+            return
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
         super().checkpoint(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
@@ -428,6 +489,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 connector.complete_store(pending.operation, synchronize=False)
                 self.dec_lock_ref(pending.node_id, pending.lock_params)
             self._external_flows.clear()
+            self._blended_requests.clear()
             self._pending_stores.clear()
             self._pending_store_counts.clear()
             self._session_finish_requested.clear()

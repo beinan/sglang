@@ -47,6 +47,8 @@ def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
     cache = cache_class.__new__(cache_class)
     cache.is_swa_enabled = swa_enabled
     cache._declined_loads = set()
+    cache._blend_ratio = None
+    cache._blended_requests = set()
     cache.lmcache_connector = SimpleNamespace(aligned_swa_window_size=lambda: 4)
     flow = SimpleNamespace(
         load=SimpleNamespace(local_hit_tokens=2, device_indices=torch.arange(2, 8)),
@@ -337,6 +339,56 @@ def test_reset_waits_for_all_transfers_before_releasing_any_slots(cache_class):
     cache.token_to_kv_pool_allocator.free.assert_called_once()
     assert cache.dec_lock_ref.call_count == 2
     assert not cache.has_pending_cache_operations()
+
+
+@pytest.mark.parametrize("local_tokens", [0, 2])
+def test_sparse_lookup_does_not_publish_a_contiguous_prefix(cache_class, local_tokens):
+    """Disjoint external hits survive admission without inflating prefix coverage."""
+    cache, req, flow, _, _ = _deferred_load_cache(cache_class)
+    cache._blend_ratio = 0.25
+    flow.total_hit = None
+    flow.lookup.lock_start = 0
+    flow.lookup.blend_result = SimpleNamespace(
+        non_prefix_segments=[SimpleNamespace(cur_st=4, cur_ed=8)],
+        segmented_prefix_segments=[],
+    )
+    cache.lmcache_connector.poll_lookup.return_value = 0
+    local = MatchResult(
+        device_prefix_len=local_tokens,
+        last_device_node=42,
+        last_host_node=None,
+        best_match_node=None,
+    )
+    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=local):
+        assert cache.check_prefetch_progress(req.cache_request_handle)
+        assert cache.prefetch_loaded_tokens_by_reqid[req.cache_request_handle] == 0
+        assert cache.match_prefix(MatchPrefixParams(flow.key, req=req)) == local
+    plan = cache.prefill_execution_plan([req.rid], [local_tokens])
+    if local_tokens:
+        assert plan is None
+    else:
+        assert plan.lookups == (flow.lookup,)
+    with mock.patch.object(UnifiedRadixCache, "on_release"):
+        cache.on_release(req, checkpointed=False)
+    assert not cache.has_pending_cache_operations()
+    cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)
+
+
+def test_approximate_prefill_is_not_published_or_stored(cache_class):
+    """A repeated prompt must not acquire an approximate result as an exact hit."""
+    cache, req, flow, _, _ = _deferred_load_cache(cache_class)
+    cache._blended_requests.add(req.rid)
+    flow.total_hit = 0
+    flow.lookup.lock_start = 0
+    with mock.patch.object(UnifiedRadixCache, "checkpoint") as publish:
+        cache.checkpoint(req, up_to=8)
+    publish.assert_not_called()
+    cache.lmcache_connector.submit_store.assert_not_called()
+    cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)
+    assert not cache.has_pending_cache_operations()
+    with mock.patch.object(UnifiedRadixCache, "on_release"):
+        cache.on_release(req, checkpointed=True)
+    assert req.rid not in cache._blended_requests
 
 
 if __name__ == "__main__":

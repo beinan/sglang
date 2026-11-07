@@ -660,6 +660,14 @@ class TpModelWorker(BaseTpWorker):
                 return_hidden_states_before_norm=False,
                 input_ids_from_graph=input_ids_from_graph,
                 pp_loras=pp_loras,
+                prefill_plan=(
+                    batch.tree_cache.prefill_execution_plan(
+                        [req.rid for req in batch.reqs], batch.prefix_lens
+                    )
+                    if batch.forward_mode.is_extend_without_speculative()
+                    and batch.tree_cache is not None
+                    else None
+                ),
             )
             if folded is not None:
                 apply_folded_extend(folded, forward_batch)
