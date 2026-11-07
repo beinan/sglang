@@ -211,6 +211,19 @@ global_override_indptr_cpu = None
 global_override_window_indptr_cpu = None
 
 
+def _plan_sparse_fallback(
+    begin_forward: Callable[..., None],
+    query: SparseQueryMetadata,
+    kv_lens: list[int],
+) -> None:
+    """Build the FA2 mask only when a sparse layer needs the fallback."""
+    mask = query.causal_mask(kv_lens)
+    kwargs = {}
+    if len(kv_lens) == 1:
+        kwargs["packed_custom_mask"] = packbits(mask, bitorder="little")
+    begin_forward(custom_mask=mask, **kwargs)
+
+
 def fast_prefill_plan(
     self,
     qo_indptr: torch.Tensor,
@@ -2505,7 +2518,6 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_last_page_len = torch.ones(
                     bs, dtype=torch.int32, device="cpu", pin_memory=True
                 )
-                custom_mask = sparse_query.causal_mask(seq_lens_cpu.tolist())
             else:
                 query_lens = seq_lens - prefix_lens
                 qo_indptr[1 : bs + 1] = torch.cumsum(query_lens, dim=0)
@@ -2541,6 +2553,48 @@ class FlashInferIndicesUpdaterPrefill:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
+
+        if sparse_query is not None:
+            kv_lens = seq_lens_cpu.tolist()
+            if (
+                _CUTE_SPARSE_AVAILABLE
+                and self.q_data_type == self.data_type == torch.bfloat16
+                and self.head_dim == 128
+                and self.attn_backend.page_size >= 8
+                and 128 % self.attn_backend.page_size == 0
+            ):
+                self.sparse_prefill = CuTeSparsePrefill(
+                    wrapper_paged,
+                    sparse_query,
+                    kv_indices,
+                    kv_lens,
+                    self.attn_backend.page_size,
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    plan_fallback=partial(
+                        _plan_sparse_fallback,
+                        partial(
+                            wrapper_paged.begin_forward,
+                            qo_indptr,
+                            kv_indptr,
+                            kv_indices,
+                            kv_last_page_len,
+                            self.num_qo_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            1,
+                            q_data_type=self.q_data_type,
+                            kv_data_type=self.data_type,
+                            non_blocking=True,
+                            fixed_split_size=fixed_split_size,
+                        ),
+                        sparse_query,
+                        kv_lens,
+                    ),
+                )
+                return
+            custom_mask = sparse_query.causal_mask(kv_lens)
 
         # cached part
         # Conditionally set multi-item parameters
@@ -2658,25 +2712,6 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
-
-        if (
-            sparse_query is not None
-            and _CUTE_SPARSE_AVAILABLE
-            and self.q_data_type == self.data_type == torch.bfloat16
-            and self.head_dim == 128
-            and self.attn_backend.page_size >= 8
-            and 128 % self.attn_backend.page_size == 0
-        ):
-            self.sparse_prefill = CuTeSparsePrefill(
-                wrapper_paged,
-                sparse_query,
-                kv_indices,
-                seq_lens_cpu.tolist(),
-                self.attn_backend.page_size,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            )
 
 
 def _build_draft_indptr_host(
