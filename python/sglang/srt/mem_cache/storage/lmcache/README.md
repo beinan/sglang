@@ -96,14 +96,38 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
 ```
 
 The tested path uses plain-text Qwen3 full attention, BF16, FlashInfer, one GPU,
-and prompts that fit in one prefill chunk. Active LoRA, input log probabilities,
-hidden-state capture, and unsupported model/request modes use dense prefill.
+and prompts that fit in one prefill chunk. Active LoRA, requests for log
+probabilities, hidden-state capture, and unsupported model/request modes use
+dense prefill.
 
 The first four layers recompute all suffix rows. Later layers recompute unmatched
 rows, each request's final row, and the configured fraction of matched rows with
 the largest key changes. The ratio is a fraction of matched rows, not total
 model work. Approximate results are excluded from radix and remote cache
 writeback. The input token order is unchanged.
+
+When populating source-document KV, use `logprobs: true` to take this adapter's
+dense fallback. Otherwise, a source prompt that partially matches an earlier
+document can itself be blended, and its approximate KV will not be stored.
+For example, send this body to `/v1/chat/completions`:
+
+```json
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "messages": [{"role": "user", "content": "Your source document"}],
+  "cache_salt": "documents",
+  "max_tokens": 1,
+  "logprobs": true
+}
+```
+
+Use the same cache salt for the subsequent queries and omit `logprobs` so they
+can blend. Source responses can precede asynchronous STORE completion. When
+seeding sequentially on an otherwise idle server, wait for the required
+increments of `lmcache_mp_num_finished_stores_total` before measuring reuse.
+A fully cached source needs no new STORE, so completed-store counts need not
+equal source-request counts. `--enable-cache-report` exposes each source's
+exact cached prefix in `usage.prompt_tokens_details.cached_tokens`.
 
 Omit `lmcache.sglang.blend_recompute_ratio` to use ordinary prefix caching.
 `1.0` recomputes all rows and is useful as a correctness control. The `0.5`
