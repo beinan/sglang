@@ -30,6 +30,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.layout.paged_view import (
+    packed_page_indices,
     paged_kv_view,
     paged_row_view,
     paged_view,
@@ -69,6 +70,27 @@ class TestPagedView(unittest.TestCase):
     def test_rejects_partial_pages(self):
         with self.assertRaises(AssertionError):
             paged_view(torch.zeros(10, 2, 16), 4)
+
+
+class TestPackedPageIndices(unittest.TestCase):
+    def test_partial_pages_restart_at_each_request(self) -> None:
+        tokens = torch.cat(
+            [
+                torch.arange(80, 96),
+                torch.tensor([32]),
+                torch.arange(112, 128),
+                torch.arange(16, 21),
+                torch.tensor([-1, -1]),
+            ]
+        ).to(torch.int32)
+        actual = packed_page_indices(tokens, [17, 21], 16)
+        torch.testing.assert_close(
+            actual, torch.tensor([5, 2, 7, 1], dtype=torch.int32)
+        )
+
+    def test_rejects_truncated_request_stream(self) -> None:
+        with self.assertRaises(ValueError):
+            packed_page_indices(torch.arange(16), [17], 16)
 
 
 class TestPagedKVView(unittest.TestCase):

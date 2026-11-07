@@ -287,8 +287,17 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
 
     def test_sparse_queries_preserve_positions_and_unselected_kv(self) -> None:
         """Compacting queries must preserve causal positions and physical writes."""
-        for batch_size in (1, 2):
-            with self.subTest(batch_size=batch_size):
+        for batch_size, head_dim, dtype, repeated in (
+            (1, 64, torch.float16, False),
+            (2, 64, torch.float16, False),
+            (1, 128, torch.bfloat16, False),
+            (2, 128, torch.bfloat16, False),
+            (1, 128, torch.bfloat16, True),
+            (2, 128, torch.bfloat16, True),
+        ):
+            with self.subTest(
+                batch_size=batch_size, head_dim=head_dim, repeated=repeated
+            ):
                 case = DenseAttentionCase(
                     name="sparse_gqa_across_requests_and_pages",
                     backend="flashinfer",
@@ -300,13 +309,22 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                     extend_lens=(17, 21)[:batch_size],
                 )
                 fixture = build_dense_attention_fixture(
-                    self, case, head_dim=self.HEAD_DIM, hidden_size=self.HIDDEN_SIZE
+                    self,
+                    case,
+                    head_dim=head_dim,
+                    hidden_size=self.HIDDEN_SIZE,
+                    dtype=dtype,
                 )
                 with torch.no_grad():
                     run_dense_fixture_eager(fixture)
                     batch = fixture.forward_batch
                     selected = torch.tensor(
-                        [0, 7, 16, 18, 22, 37][: 3 * batch_size], device="cuda"
+                        (
+                            [7, 16, 16, 18, 37, 37]
+                            if repeated
+                            else [0, 7, 16, 18, 22, 37]
+                        )[: 3 * batch_size],
+                        device="cuda",
                     )
                     fixture.input_hidden[selected] += 0.5
                     expected = expected_dense_fixture_output(fixture)[selected]
@@ -346,7 +364,7 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                     ):
                         torch.testing.assert_close(
                             cached[batch.out_cache_loc],
-                            updated.view(-1, case.num_kv_heads, self.HEAD_DIM),
+                            updated.view(-1, case.num_kv_heads, head_dim),
                             atol=0,
                             rtol=0,
                         )

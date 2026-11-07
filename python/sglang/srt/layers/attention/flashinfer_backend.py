@@ -18,9 +18,11 @@ import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
+from importlib.metadata import version
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+from packaging.version import Version
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
@@ -73,7 +75,12 @@ from sglang.srt.speculative.spec_utils import (
     fill_draft_window_rail,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import (
+    get_int_env_var,
+    is_flashinfer_available,
+    is_sm100_supported,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -81,6 +88,14 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+_CUTE_SPARSE_AVAILABLE = (
+    is_flashinfer_available()
+    and is_sm100_supported()
+    and Version(version("flashinfer-python")) >= Version("0.7.3")
+)
+if _CUTE_SPARSE_AVAILABLE:
+    from sglang.srt.layers.attention.cute_sparse_prefill import CuTeSparsePrefill
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -178,6 +193,7 @@ class PrefillMetadata:
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
     cp_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
+    sparse_prefill: CuTeSparsePrefill | None = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -1229,6 +1245,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+                sparse_prefill=self.indices_updater_prefill.sparse_prefill,
             )
 
     def init_cuda_graph_state(
@@ -1554,6 +1571,8 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
+        if self.forward_metadata.sparse_prefill is not None:
+            prefill_wrapper_paged = self.forward_metadata.sparse_prefill
         # Window-read planning may put the window in a custom mask. Other
         # wrappers leave per-layer windows to forward, even when planned with -1.
         paged_window_left = layer.sliding_window_size
@@ -2098,6 +2117,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.sparse_prefill: CuTeSparsePrefill | None = None
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -2422,6 +2442,7 @@ class FlashInferIndicesUpdaterPrefill:
         plan: IterationIds,
         sparse_query: Optional[SparseQueryMetadata] = None,
     ):
+        self.sparse_prefill = None
         bs = len(seq_lens)
         kv_last_page_len = self.kv_last_page_len[:bs]
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
@@ -2637,6 +2658,25 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
+
+        if (
+            sparse_query is not None
+            and _CUTE_SPARSE_AVAILABLE
+            and self.q_data_type == self.data_type == torch.bfloat16
+            and self.head_dim == 128
+            and self.attn_backend.page_size >= 8
+            and 128 % self.attn_backend.page_size == 0
+        ):
+            self.sparse_prefill = CuTeSparsePrefill(
+                wrapper_paged,
+                sparse_query,
+                kv_indices,
+                seq_lens_cpu.tolist(),
+                self.attn_backend.page_size,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
 
 
 def _build_draft_indptr_host(
