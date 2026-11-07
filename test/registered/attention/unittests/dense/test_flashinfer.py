@@ -1,5 +1,6 @@
 import unittest
 from importlib.metadata import version
+from unittest.mock import patch
 
 import torch
 from packaging.version import Version
@@ -354,7 +355,17 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                         query_lens, batch.positions
                     )
 
-                    actual = run_dense_fixture_eager(fixture)
+                    with patch.object(
+                        SparseQueryMetadata,
+                        "causal_mask",
+                        autospec=True,
+                        side_effect=SparseQueryMetadata.causal_mask,
+                    ) as materialize_mask:
+                        actual = run_dense_fixture_eager(fixture)
+                    if fixture.backend.forward_metadata.sparse_prefill is not None:
+                        materialize_mask.assert_not_called()
+                    else:
+                        materialize_mask.assert_called_once()
                     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
                     _, new_k, new_v = fixture.actual_module.project_qkv(
                         fixture.input_hidden

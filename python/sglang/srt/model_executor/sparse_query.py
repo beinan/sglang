@@ -23,6 +23,23 @@ class SparseQueryMetadata(msgspec.Struct, frozen=True):
     query_lens: tuple[int, ...]
     positions: torch.Tensor
 
+    def validate(self, kv_lens: list[int]) -> None:
+        """Check host-known counts and position shape without building a mask.
+
+        Raises:
+            ValueError: Query/KV batch sizes, counts, or position shape disagree.
+        """
+        if (
+            len(self.query_lens) != len(kv_lens)
+            or not self.query_lens
+            or any(
+                q <= 0 or q > k for q, k in zip(self.query_lens, kv_lens, strict=True)
+            )
+            or self.positions.ndim != 1
+            or self.positions.numel() != sum(self.query_lens)
+        ):
+            raise ValueError("Sparse query counts must match positions and KV lengths")
+
     def causal_mask(self, kv_lens: list[int]) -> torch.Tensor:
         """Build a request-major mask that preserves original causal positions.
 
@@ -39,16 +56,7 @@ class SparseQueryMetadata(msgspec.Struct, frozen=True):
         This eager reference path materializes O(sum(query_len * kv_len)) entries
         as boolean elements before FlashInfer packs them.
         """
-        if (
-            len(self.query_lens) != len(kv_lens)
-            or not self.query_lens
-            or any(
-                q <= 0 or q > k for q, k in zip(self.query_lens, kv_lens, strict=True)
-            )
-            or self.positions.ndim != 1
-            or self.positions.numel() != sum(self.query_lens)
-        ):
-            raise ValueError("Sparse query counts must match positions and KV lengths")
+        self.validate(kv_lens)
         return torch.cat(
             [
                 (

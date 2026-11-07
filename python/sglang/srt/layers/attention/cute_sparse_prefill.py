@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Eager original-position prefill over the runner's physical KV read stream."""
 
+from collections.abc import Callable
 from itertools import accumulate
 
 import cutlass
@@ -44,6 +45,8 @@ class CuTeSparsePrefill:
     and consumed on the caller's current CUDA stream. Position storage is linear
     in the total query count plus batch size, with a 256-entry tail for masked
     query lanes. Its capacity is bucketed to bound compilation variants.
+    An optional fallback planner runs once, on the current stream, before the
+    first unsupported layer; its captured tensors are retained until then.
     """
 
     def __init__(
@@ -56,7 +59,10 @@ class CuTeSparsePrefill:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        plan_fallback: Callable[[], None] | None = None,
     ) -> None:
+        query.validate(kv_lens)
+        self.plan_fallback = plan_fallback
         self.fallback = fallback
         self.page_size = page_size
         self.num_qo_heads = num_qo_heads
@@ -114,6 +120,9 @@ class CuTeSparsePrefill:
             or k_scale not in (None, 1.0)
             or v_scale not in (None, 1.0)
         ):
+            if self.plan_fallback is not None:
+                self.plan_fallback()
+                self.plan_fallback = None
             return self.fallback.forward(
                 q,
                 kv,
