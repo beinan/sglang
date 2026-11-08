@@ -69,7 +69,9 @@ so cleanup can be retried after the transfer completes.
 This section applies to the experimental integration branch, not a released
 SGLang/LMCache pair. It requires the SGLang sparse-query and scheduler changes
 and an LMCache server/client with chunked reservation support (protocol v2)
-and the `blend_rotary_components` capability.
+and the `blend_rotary_components` capability. Tensor parallelism additionally
+requires the connector changes for shared lookup sessions, collective rotary
+registration, and retrieve submission/completion agreement.
 
 Start the blend server with a chunk size matching SGLang's page size:
 
@@ -96,9 +98,11 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
   --chunked-prefill-size 8192
 ```
 
-The tested path uses plain-text Qwen3 full attention, BF16, FlashInfer, one GPU,
-and overlap disabled. It includes an 8,385-token Qwen3-8B prompt split into three
-prefill chunks. Each chunk retrieves only complete matches contained in its
+The tested path uses plain-text Qwen3 full attention, BF16, FlashInfer, and
+overlap disabled. An 8,385-token Qwen3-8B prompt has been validated with one and
+two GPUs (`--tp-size 1` or `2`), split into three prefill chunks. The TP2
+full-recompute control matches TP2 dense output tokens and logits; this single
+prompt does not establish answer quality across workloads. Each chunk retrieves only complete matches contained in its
 allocated window; matches crossing a window boundary are recomputed. Active LoRA,
 requests for log probabilities, hidden-state capture, and unsupported
 model/request modes use dense prefill.
@@ -107,7 +111,10 @@ The first four layers recompute all suffix rows. Later layers recompute unmatche
 rows, each request's final row, and the configured fraction of matched rows with
 the largest key changes. The ratio is a fraction of matched rows, not total
 model work. Approximate results are excluded from radix and remote cache
-writeback. The input token order is unchanged.
+writeback. The input token order is unchanged. With TP, key-change scores are summed
+across shards and every rank uses the same selected rows. All ranks agree
+transfer completion before using cached KV. RPC/device errors stop the forward
+pass because destination completion may be unknown.
 
 When populating source-document KV, use `logprobs: true` to take this adapter's
 dense fallback. Otherwise, a source prompt that partially matches an earlier
