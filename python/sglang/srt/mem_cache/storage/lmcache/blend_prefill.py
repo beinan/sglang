@@ -88,7 +88,9 @@ def select_blend_queries(
     if tp_group.world_size > 1:
         # PyNCCL supports uint8, but not bool, for the selection broadcast.
         selected_mask = tp_group.broadcast(selected_mask.to(torch.uint8)).bool()
-    query_lens = [int(mask.sum()) for mask in selected_mask.split(lengths)]
+    # Read all request counts together to avoid a device sync per request.
+    counts = [mask.sum() for mask in selected_mask.split(lengths)]
+    query_lens = torch.stack(counts).tolist() if counts else []
     return selected_mask.nonzero().flatten(), query_lens
 
 
