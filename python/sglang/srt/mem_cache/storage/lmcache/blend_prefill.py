@@ -227,7 +227,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
                     matches=matches,
                     producer_stream=torch.cuda.current_stream(),
                 )
-                if future.result():
+                if self.connector.complete_blend_retrieve(future):
                     retrieved = True
                     for match in matches:
                         start = offset + match.cur_st - prefix_len
