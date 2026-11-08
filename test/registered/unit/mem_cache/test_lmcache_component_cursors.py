@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.lmcache.blend_prefill import (
     BlendPrefillPlan,
     BlendRotaryRegistration,
+    select_blend_queries,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -559,3 +560,43 @@ def test_final_blend_checkpoint_preserves_published_dense_chunks(cache_class):
     assert req.kv.cache_protected_len == 16
     cache.lmcache_connector.submit_store.assert_not_called()
     cache.lmcache_connector.finish_request.assert_called_once_with(req.rid)
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
+def test_blend_queries_agree_across_shards(ratio):
+    covered = torch.tensor([True, True, True, False, True, True, True, True])
+    deltas = [
+        torch.tensor([10.0, 0, 6, 0, 0, 9, 0, 0]),
+        torch.tensor([0.0, 10, 6, 0, 0, 0, 20, 0]),
+    ]
+    groups = [mock.Mock(world_size=2, rank_in_group=rank) for rank in range(2)]
+    for group in groups:
+        group.all_reduce.return_value = deltas[0] + deltas[1]
+    groups[0].broadcast.side_effect = lambda mask: mask
+    leader, counts = select_blend_queries(deltas[0], covered, [5, 3], ratio, groups[0])
+    mask = groups[0].broadcast.call_args.args[0]
+    assert mask.dtype == torch.uint8
+    groups[1].broadcast.return_value = mask
+    follower, follower_counts = select_blend_queries(
+        deltas[1], covered, [5, 3], ratio, groups[1]
+    )
+    assert torch.equal(leader, follower)
+    assert counts == follower_counts
+    assert {3, 4, 7} <= set(leader.tolist())
+    if ratio == 0:
+        assert leader.tolist() == [3, 4, 7]
+        assert counts == [2, 1]
+    elif ratio == 1:
+        assert leader.tolist() == list(range(8))
+        assert counts == [5, 3]
+    else:
+        assert {2, 3, 4, 6, 7} <= set(leader.tolist())
+        assert counts == [4, 2]
+    single = mock.Mock(world_size=1, rank_in_group=0)
+    single_rows, single_counts = select_blend_queries(
+        deltas[0] + deltas[1], covered, [5, 3], ratio, single
+    )
+    assert torch.equal(single_rows, leader)
+    assert single_counts == counts
+    single.all_reduce.assert_not_called()
+    single.broadcast.assert_not_called()

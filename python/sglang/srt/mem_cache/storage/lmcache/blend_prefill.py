@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     )
     from lmcache.v1.multiprocess.custom_types import CBMatchResult
 
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -47,6 +48,48 @@ def select_blend_matches(
         if match.cur_st >= prefix_len
         and (allocated_end is None or match.cur_ed <= allocated_end)
     ]
+
+
+def select_blend_queries(
+    delta: torch.Tensor,
+    covered: torch.Tensor,
+    lengths: list[int],
+    recompute_ratio: float,
+    tp_group: GroupCoordinator,
+) -> tuple[torch.Tensor, list[int]]:
+    """Select identical request-major query rows across tensor-parallel shards.
+
+    Args:
+        delta: Per-token mean squared K change for an equal-width local shard.
+            The collective may reduce this tensor in place.
+        covered: Matched rows; must be identical across the group.
+        lengths: Positive chunk lengths in the same request order on every rank.
+        recompute_ratio: Fraction of matched rows to recompute, in [0, 1].
+        tp_group: Ranks processing this batch, excluding other DP batches.
+
+    Returns:
+        Sorted flattened row indices and per-request query counts. Unmatched
+        rows and each chunk's final row are always selected. Summing shard
+        means preserves the global score ordering; broadcasting the leader's
+        mask also keeps tied scores from producing different row choices.
+    """
+    if tp_group.world_size > 1:
+        delta = tp_group.all_reduce(delta)
+    selected_mask = ~covered
+    if tp_group.rank_in_group == 0:
+        offset = 0
+        for length in lengths:
+            matched = covered[offset : offset + length].nonzero().flatten() + offset
+            selected_mask[offset + length - 1] = True
+            count = int(len(matched) * recompute_ratio)
+            if count:
+                selected_mask[matched[delta[matched].topk(count).indices]] = True
+            offset += length
+    if tp_group.world_size > 1:
+        # PyNCCL supports uint8, but not bool, for the selection broadcast.
+        selected_mask = tp_group.broadcast(selected_mask.to(torch.uint8)).bool()
+    query_lens = [int(mask.sum()) for mask in selected_mask.split(lengths)]
+    return selected_mask.nonzero().flatten(), query_lens
 
 
 class BlendRotaryRegistration:
@@ -110,6 +153,7 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
             )
 
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from sglang.srt.layers.dp_attention import get_dp_tp_group
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
         from sglang.srt.layers.logits_processor import LogitsMetadata
         from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -204,18 +248,13 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
             delta = (
                 (current_keys.float() - cached_keys.float()).flatten(1).square().mean(1)
             )
-            selected_mask = ~covered
-            query_lens = []
-            offset = 0
-            for length in fb.extend_seq_lens_cpu:
-                matched = covered[offset : offset + length].nonzero().flatten() + offset
-                selected_mask[offset + length - 1] = True
-                count = int(len(matched) * self.recompute_ratio)
-                if count:
-                    selected_mask[matched[delta[matched].topk(count).indices]] = True
-                query_lens.append(int(selected_mask[offset : offset + length].sum()))
-                offset += length
-            selected = selected_mask.nonzero().flatten()
+            selected, query_lens = select_blend_queries(
+                delta,
+                covered,
+                fb.extend_seq_lens_cpu,
+                self.recompute_ratio,
+                get_dp_tp_group(),
+            )
             self.blended_requests.update(
                 op.request_id
                 for op, query_len, length in zip(
