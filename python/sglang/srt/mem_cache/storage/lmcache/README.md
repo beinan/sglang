@@ -68,7 +68,8 @@ so cleanup can be retried after the transfer completes.
 
 This section applies to the experimental integration branch, not a released
 SGLang/LMCache pair. It requires the SGLang sparse-query and scheduler changes
-and an LMCache server/client with protocol-v2 rotary component support.
+and an LMCache server/client with chunked reservation support (protocol v2)
+and the `blend_rotary_components` capability.
 
 Start the blend server with a chunk size matching SGLang's page size:
 
@@ -96,9 +97,11 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
 ```
 
 The tested path uses plain-text Qwen3 full attention, BF16, FlashInfer, one GPU,
-and prompts that fit in one prefill chunk. Active LoRA, requests for log
-probabilities, hidden-state capture, and unsupported model/request modes use
-dense prefill.
+and overlap disabled. It includes an 8,385-token Qwen3-8B prompt split into three
+prefill chunks. Each chunk retrieves only complete matches contained in its
+allocated window; matches crossing a window boundary are recomputed. Active LoRA,
+requests for log probabilities, hidden-state capture, and unsupported
+model/request modes use dense prefill.
 
 The first four layers recompute all suffix rows. Later layers recompute unmatched
 rows, each request's final row, and the configured fraction of matched rows with
