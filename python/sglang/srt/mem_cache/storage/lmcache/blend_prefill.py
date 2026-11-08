@@ -295,13 +295,14 @@ class BlendPrefillPlan(msgspec.Struct, frozen=True):
             for i in range(CALIBRATION_LAYERS, body.end_layer):
                 hidden = body.layers[i](compact.positions, hidden, compact)
             normalized = residual_batch.final_norm(hidden, compact, body.norm)
-            logger.info(
-                "CacheBlend prefill requests=%s tokens=%d matched=%d queries=%s",
-                fb.rids,
-                len(slots),
-                int(covered.sum()),
-                query_lens,
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "CacheBlend prefill requests=%s tokens=%d matched=%d queries=%s",
+                    fb.rids,
+                    len(slots),
+                    int(covered.sum()),
+                    query_lens,
+                )
             return model.logits_processor(
                 compact.input_ids,
                 normalized,
